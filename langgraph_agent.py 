@@ -1,0 +1,330 @@
+import json
+from typing import TypedDict, List, Any
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from config import llm, vector_store, embeddings
+import os
+
+# ============ STATE DEFINITION ============
+class StudyPlanState(TypedDict):
+    """State for the study planning workflow"""
+    syllabus: str
+    topics: List[str]
+    notes_text: str
+    study_plan: str
+    flashcards: List[dict]
+    mcqs: List[dict]
+    spaced_repetition: dict
+    error: str
+
+# ============ NODE 1: EXTRACT TOPICS ============
+def extract_topics_node(state: StudyPlanState) -> StudyPlanState:
+    """Extract topics from syllabus using LLM"""
+    print("🔍 Node 1: Extracting topics from syllabus...")
+    
+    prompt = f"""Extract all main topics from this syllabus. Return as a JSON array of strings.
+Syllabus:
+{state['syllabus']}
+
+Return ONLY valid JSON array like: ["Topic1", "Topic2", "Topic3"]
+No extra text, no markdown."""
+    
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        topics_text = response.content.strip()
+        
+        # Clean response (remove markdown if present)
+        if topics_text.startswith("```
+            topics_text = topics_text.split("```")[1]
+            if topics_text.startswith("json"):
+                topics_text = topics_text[4:]
+        
+        topics = json.loads(topics_text)
+        state["topics"] = topics
+        print(f"✅ Extracted {len(topics)} topics: {topics[:3]}...")
+    except Exception as e:
+        state["error"] = f"Failed to extract topics: {str(e)}"
+        print(f"❌ Error: {state['error']}")
+    
+    return state
+
+# ============ NODE 2: LOAD & INDEX NOTES ============
+def load_notes_node(state: StudyPlanState) -> StudyPlanState:
+    """Load PDF/MD files and index into Chroma"""
+    print("📚 Node 2: Loading and indexing notes...")
+    
+    notes_folder = "./notes"
+    if not os.path.exists(notes_folder):
+        print(f"⚠️  Notes folder not found: {notes_folder}")
+        return state
+    
+    documents = []
+    
+    try:
+        # Load all PDFs and markdown files
+        for file in os.listdir(notes_folder):
+            filepath = os.path.join(notes_folder, file)
+            
+            if file.endswith(".pdf"):
+                loader = PyPDFLoader(filepath)
+                docs = loader.load()
+                documents.extend(docs)
+                print(f"  📄 Loaded PDF: {file}")
+            
+            elif file.endswith((".md", ".txt")):
+                loader = TextLoader(filepath)
+                docs = loader.load()
+                documents.extend(docs)
+                print(f"  📝 Loaded text: {file}")
+        
+        if documents:
+            # Split into chunks
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200
+            )
+            chunks = splitter.split_documents(documents)
+            
+            # Add to Chroma vector store
+            vector_store.add_documents(chunks)
+            state["notes_text"] = f"Indexed {len(chunks)} chunks from {len(documents)} documents"
+            print(f"✅ Indexed {len(chunks)} chunks into Chroma")
+        else:
+            state["notes_text"] = "No documents found in notes folder"
+    
+    except Exception as e:
+        state["error"] = f"Failed to load notes: {str(e)}"
+        print(f"❌ Error: {state['error']}")
+    
+    return state
+
+# ============ NODE 3: CREATE STUDY PLAN ============
+def create_study_plan_node(state: StudyPlanState) -> StudyPlanState:
+    """Generate 7-day study plan using LLM"""
+    print("📅 Node 3: Creating 7-day study plan...")
+    
+    topics_str = ", ".join(state["topics"])
+    
+    # Retrieve relevant notes from vector store
+    retrieved_docs = vector_store.similarity_search(topics_str, k=5)
+    context = "\n".join([doc.page_content for doc in retrieved_docs])
+    
+    prompt = f"""Create a structured 7-day study plan for these topics: {topics_str}
+    
+Available notes context:
+{context}
+
+Format as JSON:
+{{
+  "plan": [
+    {{"day": 1, "date": "Day 1", "tasks": [
+      {{"topic": "Topic1", "hours": 3, "priority": "high"}}
+    ]}}
+  ]
+}}
+
+Ensure:
+- Total study hours per day: 2-4 hours
+- Balance between topics
+- Include review sessions"""
+    
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        plan_text = response.content.strip()
+        
+        if plan_text.startswith("```
+            plan_text = plan_text.split("```")[1]
+            if plan_text.startswith("json"):
+                plan_text = plan_text[4:]
+        
+        plan_json = json.loads(plan_text)
+        state["study_plan"] = json.dumps(plan_json, indent=2)
+        print("✅ Study plan created")
+    except Exception as e:
+        state["error"] = f"Failed to create study plan: {str(e)}"
+        state["study_plan"] = "Error creating plan"
+        print(f"❌ Error: {state['error']}")
+    
+    return state
+
+# ============ NODE 4: GENERATE FLASHCARDS ============
+def generate_flashcards_node(state: StudyPlanState) -> StudyPlanState:
+    """Generate 20 flashcards with spaced repetition schedule"""
+    print("🧠 Node 4: Generating flashcards...")
+    
+    topics_str = ", ".join(state["topics"][:3])  # Use first 3 topics
+    
+    # Retrieve context for flashcard generation
+    retrieved_docs = vector_store.similarity_search(topics_str, k=8)
+    context = "\n".join([doc.page_content for doc in retrieved_docs])
+    
+    prompt = f"""Create 20 high-quality flashcards for studying these topics: {topics_str}
+
+Available content:
+{context}
+
+Format as JSON array:
+[
+  {{
+    "id": 1,
+    "question": "What are the 3 states of a process?",
+    "answer": "New, Ready, Running",
+    "difficulty": "easy",
+    "spaced_repetition": ["day1", "day3", "day7"]
+  }}
+]
+
+Requirements:
+- Mix easy (5), medium (10), hard (5) questions
+- Include conceptual, definitional, and problem-solving questions
+- Keep answers concise
+- Include spaced repetition schedule"""
+    
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        flashcards_text = response.content.strip()
+        
+        if flashcards_text.startswith("```
+            flashcards_text = flashcards_text.split("```")[1]
+            if flashcards_text.startswith("json"):
+                flashcards_text = flashcards_text[4:]
+        
+        flashcards = json.loads(flashcards_text)
+        state["flashcards"] = flashcards
+        print(f"✅ Generated {len(flashcards)} flashcards")
+    except Exception as e:
+        state["error"] = f"Failed to generate flashcards: {str(e)}"
+        state["flashcards"] = []
+        print(f"❌ Error: {state['error']}")
+    
+    return state
+
+# ============ NODE 5: GENERATE MCQs ============
+def generate_mcqs_node(state: StudyPlanState) -> StudyPlanState:
+    """Generate 10 multiple-choice questions per topic"""
+    print("❓ Node 5: Generating MCQs...")
+    
+    topics_str = ", ".join(state["topics"][:3])
+    
+    # Retrieve context
+    retrieved_docs = vector_store.similarity_search(topics_str, k=8)
+    context = "\n".join([doc.page_content for doc in retrieved_docs])
+    
+    prompt = f"""Create 10 multiple-choice questions for these topics: {topics_str}
+
+Context:
+{context}
+
+Format as JSON array:
+[
+  {{
+    "id": 1,
+    "question": "Question here?",
+    "options": ["A) Option1", "B) Option2", "C) Option3", "D) Option4"],
+    "correct_answer": "B",
+    "explanation": "Why B is correct",
+    "topic": "Topic name"
+  }}
+]
+
+Requirements:
+- Include 5 easy, 3 medium, 2 hard questions
+- Mix question types: conceptual, numerical, application
+- Include detailed explanations"""
+    
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        mcqs_text = response.content.strip()
+        
+        if mcqs_text.startswith("```
+            mcqs_text = mcqs_text.split("```")[1]
+            if mcqs_text.startswith("json"):
+                mcqs_text = mcqs_text[4:]
+        
+        mcqs = json.loads(mcqs_text)
+        state["mcqs"] = mcqs
+        print(f"✅ Generated {len(mcqs)} MCQs")
+    except Exception as e:
+        state["error"] = f"Failed to generate MCQs: {str(e)}"
+        state["mcqs"] = []
+        print(f"❌ Error: {state['error']}")
+    
+    return state
+
+# ============ NODE 6: CREATE SPACED REPETITION SCHEDULE ============
+def create_spaced_repetition_node(state: StudyPlanState) -> StudyPlanState:
+    """Generate spaced repetition schedule"""
+    print("📊 Node 6: Creating spaced repetition schedule...")
+    
+    schedule = {
+        "flashcards_review": {
+            "day_1": [i for i in range(1, 21)],  # Review all on day 1
+            "day_3": [i for i in range(1, 11)],  # Review first 10 on day 3
+            "day_7": [i for i in range(1, 6)],   # Review first 5 on day 7
+            "day_14": [1, 2, 3]                  # Review first 3 on day 14
+        },
+        "mcqs_review": {
+            "day_2": list(range(1, 6)),
+            "day_5": list(range(1, 8)),
+            "day_10": list(range(1, 11))
+        },
+        "recommended_study_times": {
+            "morning": "8:00 AM - 11:00 AM",
+            "afternoon": "3:00 PM - 5:00 PM",
+            "evening": "7:00 PM - 9:00 PM"
+        }
+    }
+    
+    state["spaced_repetition"] = schedule
+    print("✅ Spaced repetition schedule created")
+    return state
+
+# ============ BUILD LANGGRAPH ============
+def build_study_graph():
+    """Construct the LangGraph workflow"""
+    graph = StateGraph(StudyPlanState)
+    
+    # Add nodes
+    graph.add_node("extract_topics", extract_topics_node)
+    graph.add_node("load_notes", load_notes_node)
+    graph.add_node("create_plan", create_study_plan_node)
+    graph.add_node("flashcards", generate_flashcards_node)
+    graph.add_node("mcqs", generate_mcqs_node)
+    graph.add_node("spaced_rep", create_spaced_repetition_node)
+    
+    # Add edges (linear flow)
+    graph.add_edge("extract_topics", "load_notes")
+    graph.add_edge("load_notes", "create_plan")
+    graph.add_edge("create_plan", "flashcards")
+    graph.add_edge("flashcards", "mcqs")
+    graph.add_edge("mcqs", "spaced_rep")
+    graph.add_edge("spaced_rep", END)
+    
+    # Set entry point
+    graph.set_entry_point("extract_topics")
+    
+    return graph.compile()
+
+# ============ RUN AGENT ============
+def run_study_agent(syllabus: str) -> StudyPlanState:
+    """Execute the study planning agent"""
+    print("\n🚀 Starting Study Copilot Agent...\n")
+    
+    graph = build_study_graph()
+    
+    initial_state = StudyPlanState(
+        syllabus=syllabus,
+        topics=[],
+        notes_text="",
+        study_plan="",
+        flashcards=[],
+        mcqs=[],
+        spaced_repetition={},
+        error=""
+    )
+    
+    final_state = graph.invoke(initial_state)
+    print("\n✅ Agent workflow completed!\n")
+    return final_state
