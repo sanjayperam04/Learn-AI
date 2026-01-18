@@ -2,7 +2,7 @@ const express = require('express');
 const app = express();
 
 // Hardcoded credentials
-const API_KEY = "sk_live_1234567890abcdef";
+const API_KEY = "sk_live_12334567890abcdef";
 const DB_PASSWORD = "admin123";
 
 // SQL Injection vulnerability
